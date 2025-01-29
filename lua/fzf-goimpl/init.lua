@@ -1,7 +1,32 @@
 local M = {}
 
+local builtin = require("fzf-lua.previewer.builtin")
+
+local InterfacePreviewer = builtin.buffer_or_file:extend()
+
+function InterfacePreviewer:new(o, opts, fzf_win)
+	InterfacePreviewer.super.new(self, o, opts, fzf_win)
+	setmetatable(self, InterfacePreviewer)
+	return self
+end
+
+local function parse_entry(s)
+	local symbol = string.gmatch(s, "%S+")()
+	local path, line, col = s:match("\t\t\t([^:]+):(%d+):(%d+)")
+	return {
+		symbol = symbol,
+		path = path,
+		line = line,
+		col = col,
+	}
+end
+
+function InterfacePreviewer:parse_entry(entry_str)
+	return parse_entry(entry_str)
+end
+
 local function execute_impl(type, interface)
-	local result = { "}", "" }
+	local result = { "" }
 	local command_success, command_output =
 		pcall(vim.fn.system, { "impl", string.sub(type:lower(), 1, 1) .. " *" .. type, interface })
 
@@ -13,9 +38,22 @@ local function execute_impl(type, interface)
 		vim.notify("Error while executing impl command: " .. command_output, 4)
 	end
 
-	table.insert(result, "")
-
 	return result
+end
+
+local function make_entry(s)
+	local item = vim.lsp.util.symbols_to_items({ s })[1]
+	local symbol = item.text:sub(#item.kind + 4)
+	local result = {
+		symbol .. string.rep(" ", 30 - #symbol),
+		"\t\t\t",
+		item.filename,
+		":",
+		item.lnum,
+		":",
+		item.col,
+	}
+	return table.concat(result, "")
 end
 
 M.impl = function()
@@ -29,21 +67,34 @@ M.impl = function()
 	end
 	local sr, sc, er, ec = node:range()
 	local type = vim.api.nvim_buf_get_text(buf, sr, sc, er, ec, {})[1]
-
-	require("fzf-lua").lsp_live_workspace_symbols({
-		complete = function(selected)
-			local suffix = "Interface]"
-			if string.find(selected[1], "Interface]") == nil then
-				vim.notify("Select interface", 4)
-				return
+	local fzf = require("fzf-lua")
+	fzf.fzf_live(function(query)
+		return function(cb)
+			local co = coroutine.running()
+			local all_symbols, err = vim.lsp.buf_request_sync(buf, "workspace/symbol", { query = query }, 10000)
+			if err ~= nil then
+				vim.notify("Error while getting interfaces: " .. err, 4)
 			end
-			local interface_name = string.sub(selected[1], string.find(selected[1], suffix) + #suffix + 1)
-			interface_name = string.sub(interface_name, 1, string.find(interface_name, " "))
-			local lines = execute_impl(type, interface_name)
-			vim.print(lines)
-			_, _, er, ec = node:parent():range()
-			er = er
-			vim.api.nvim_buf_set_text(buf, er, ec, er, ec, lines)
+			for _, symbols in ipairs(all_symbols) do
+				if symbols.result == nil then
+					goto continue
+				end
+				for _, s in ipairs(symbols.result) do
+					if s.kind == vim.lsp.protocol.SymbolKind.Interface then
+						cb(make_entry(s))
+					end
+				end
+				::continue::
+			end
+			cb()
+		end
+	end, {
+		previewer = InterfacePreviewer,
+		complete = function(selected)
+			local lines = execute_impl(type, parse_entry(selected[1]).symbol)
+			_, _, er, _ = node:parent():range()
+			er = er + 1
+			vim.api.nvim_buf_set_lines(buf, er, er, true, lines)
 		end,
 	})
 end
